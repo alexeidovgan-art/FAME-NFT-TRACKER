@@ -1,6 +1,6 @@
 
-import os
 import logging
+import os
 from html import escape
 from urllib.parse import urlparse
 
@@ -22,162 +22,57 @@ from .db import (
     is_worker,
     get_listing,
     claim_listing,
+    release_claim,
 )
 
 logger = logging.getLogger(__name__)
 
 ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
-    if x.strip()
+    int(value.strip())
+    for value in os.getenv("ADMIN_IDS", "").split(",")
+    if value.strip()
 }
 
 
-def valid_url(value, allow_telegram=False):
+def valid_url(value):
     if not value:
         return False
 
-    value = str(value).strip()
-    parsed = urlparse(value)
-
-    if parsed.scheme in ("https", "http") and parsed.netloc:
-        return True
-
-    if allow_telegram and parsed.scheme == "tg":
-        return True
-
-    return False
+    try:
+        parsed = urlparse(str(value))
+        return (
+            parsed.scheme in ("https", "http")
+            and bool(parsed.netloc)
+        )
+    except ValueError:
+        return False
 
 
 def card(row, hidden=False):
     if hidden:
-        return (
-            "🔒 <b>ЛОГ ЗАНЯТ</b>\n"
-            "Информация скрыта."
-        )
+        return "🔒 <b>ЛОГ ЗАНЯТ</b>\nИнформация скрыта."
 
     return (
         f"🎁 <b>{escape(str(row['title']))}</b>\n"
         f"💰 Цена: <b>{escape(str(row['price']))}</b>\n"
-        f"{escape(str(row['details']))}\n"
+        f"{row['details']}\n"
         f'<a href="{escape(str(row["gift_url"]), quote=True)}">'
         "Открыть подарок</a>"
     )
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "FAME NFT TRACKER\n"
-        "/worfame — включить личные уведомления.\n"
-        "/adminfame — проверка админ-доступа."
-    )
-
-
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    thread_id = update.effective_message.message_thread_id or 0
-
-    await update.effective_message.reply_text(
-        f"Ваш Telegram ID: {user_id}\n"
-        f"ID чата: {chat_id}\n"
-        f"ID темы: {thread_id}\n"
-        "Скопируйте нужные значения в настройки проекта."
-    )
-
-
-async def worfame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    # Сохраняем пользователя в базе.
-    # Повторное включение не создаёт дубликат.
-    set_worker(user_id)
-
-    await update.message.reply_text(
-        "✅ Личные уведомления включены.\n"
-        "Повторно вводить /worfame не нужно."
-    )
-
-
-async def adminfame(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Нет административного доступа.")
-        return
-
-    await update.message.reply_text(
-        "Админ-доступ подтверждён."
-    )
-
-
-async def claim(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    q = update.callback_query
-
-    if not q or not q.data:
-        return
-
-    listing_id = q.data.split(":", 1)[1]
-
-    row = get_listing(listing_id)
-
-    if not row:
-        await q.answer("Лот не найден.", show_alert=True)
-        return
-
-    if not is_worker(q.from_user.id):
-        await q.answer(
-            "Сначала отправьте боту /worfame.",
-            show_alert=True,
+def claim_keyboard(listing_id):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Занять лог",
+            callback_data=f"claim:{listing_id}",
         )
-        return
+    ]])
 
-    # Проверяем обе ссылки до занятия лога.
-    if not valid_url(row["gift_url"]):
-        await q.answer(
-            "У подарка нет действительной ссылки.",
-            show_alert=True,
-        )
-        return
 
-    if not valid_url(row["owner_url"], allow_telegram=True):
-        await q.answer(
-            "Не удалось подтвердить ссылку на профиль владельца. "
-            "Лог не занят.",
-            show_alert=True,
-        )
-        return
-
-    # Атомарное занятие: только один пользователь сможет забрать лог.
-    if not claim_listing(listing_id, q.from_user.id):
-        await q.answer(
-            "Этот лог уже занят.",
-            show_alert=True,
-        )
-        return
-
-    # Подтверждаем нажатие один раз.
-    await q.answer("Лог закреплён за вами.")
-
-    row = get_listing(listing_id)
-
-    # Сразу скрываем данные для всех участников группы.
-    try:
-        await q.edit_message_text(
-            text=card(row, hidden=True),
-            parse_mode="HTML",
-            reply_markup=None,
-            disable_web_page_preview=True,
-        )
-    except TelegramError:
-        logger.exception(
-            "Не удалось скрыть сообщение лога %s",
-            listing_id,
-        )
-
-    # Ровно две кнопки в личном сообщении.
-    keyboard = InlineKeyboardMarkup([
+def private_keyboard(row):
+    # Ровно две кнопки.
+    return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(
                 "Поставить подарок",
@@ -192,28 +87,170 @@ async def claim(
         ],
     ])
 
-    try:
-        await context.bot.send_message(
-            chat_id=q.from_user.id,
-            text=card(row),
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
 
-        logger.info(
-            "Лог %s занят пользователем %s",
-            listing_id,
-            q.from_user.id,
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text(
+        "FAME NFT TRACKER\n"
+        "/worfame — включить личные уведомления.\n"
+        "/id — показать ID пользователя и чата.\n"
+        "/adminfame — проверить административный доступ."
+    )
+
+
+async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    thread_id = update.effective_message.message_thread_id or 0
+
+    await update.effective_message.reply_text(
+        f"Ваш Telegram ID: {user_id}\n"
+        f"ID чата: {chat_id}\n"
+        f"ID темы: {thread_id}"
+    )
+
+
+async def worfame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_worker(update.effective_user.id)
+
+    await update.effective_message.reply_text(
+        "✅ Личные уведомления включены.\n"
+        "Теперь можно занимать логи."
+    )
+
+
+async def adminfame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.effective_message.reply_text(
+            "Нет административного доступа."
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Админ-доступ подтверждён."
+    )
+
+
+async def claim(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+
+    if not query or not query.data:
+        return
+
+    listing_id = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+
+    row = get_listing(listing_id)
+
+    if not row:
+        await query.answer("Лот не найден.", show_alert=True)
+        return
+
+    if not is_worker(user_id):
+        await query.answer(
+            "Сначала отправьте боту /start, затем /worfame.",
+            show_alert=True,
+        )
+        return
+
+    if not valid_url(row["gift_url"]):
+        await query.answer(
+            "Ссылка на подарок недействительна.",
+            show_alert=True,
+        )
+        return
+
+    if not valid_url(row["owner_url"]):
+        await query.answer(
+            "Нет подтверждённой публичной ссылки владельца.",
+            show_alert=True,
+        )
+        return
+
+    # Один пользователь получает право на лог.
+    if not claim_listing(listing_id, user_id):
+        await query.answer(
+            "Этот лог уже занят.",
+            show_alert=True,
+        )
+        return
+
+    await query.answer("Лог закреплён за вами.")
+
+    row = get_listing(listing_id)
+
+    # Скрываем карточку в группе.
+    try:
+        await query.edit_message_text(
+            text=card(row, hidden=True),
+            parse_mode="HTML",
+            reply_markup=None,
+            disable_web_page_preview=True,
         )
 
     except TelegramError:
         logger.exception(
-            "Не удалось отправить личное сообщение: "
-            "лог %s, пользователь %s",
+            "Не удалось скрыть карточку %s",
             listing_id,
-            q.from_user.id,
         )
+
+    # Отправляем личную копию.
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=card(row),
+            parse_mode="HTML",
+            reply_markup=private_keyboard(row),
+            disable_web_page_preview=True,
+        )
+
+        logger.info(
+            "Лог %s успешно отправлен пользователю %s",
+            listing_id,
+            user_id,
+        )
+
+    except TelegramError:
+        logger.exception(
+            "Не удалось отправить личную копию лога %s пользователю %s",
+            listing_id,
+            user_id,
+        )
+
+        # Возвращаем лог в свободное состояние.
+        release_claim(listing_id, user_id)
+
+        # Возвращаем исходную карточку в группу.
+        try:
+            await context.bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                message_thread_id=query.message.message_thread_id,
+                text=card(get_listing(listing_id)),
+                parse_mode="HTML",
+                reply_markup=claim_keyboard(listing_id),
+                disable_web_page_preview=True,
+            )
+
+        except TelegramError:
+            logger.exception(
+                "Не удалось восстановить карточку %s",
+                listing_id,
+            )
+
+        try:
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=(
+                    "Не удалось отправить лог в личные сообщения. "
+                    "Проверь, что ты нажал /start у бота."
+                ),
+                message_thread_id=query.message.message_thread_id,
+            )
+        except TelegramError:
+            logger.exception("Не удалось отправить сообщение об ошибке")
 
 
 def register_handlers(app):
