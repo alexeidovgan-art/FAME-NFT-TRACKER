@@ -1,4 +1,3 @@
-
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -16,31 +15,41 @@ def _prepare_path():
 @contextmanager
 def conn():
     _prepare_path()
-
     db = sqlite3.connect(DB, timeout=30)
     db.row_factory = sqlite3.Row
 
     try:
         db.execute("PRAGMA busy_timeout=30000")
         db.execute("PRAGMA foreign_keys=ON")
-
         yield db
-
         db.commit()
-
     except Exception:
         db.rollback()
         raise
-
     finally:
         db.close()
+
+
+def _columns(db, table):
+    return {
+        row["name"]
+        for row in db.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    }
+
+
+def _add_column(db, table, name, definition):
+    if name not in _columns(db, table):
+        db.execute(
+            f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+        )
 
 
 def init_db():
     with conn() as db:
         db.execute("PRAGMA journal_mode=WAL")
 
-        # Таблица листингов
         db.execute("""
             CREATE TABLE IF NOT EXISTS listings (
                 id TEXT PRIMARY KEY,
@@ -57,7 +66,6 @@ def init_db():
             )
         """)
 
-        # Таблица пользователей, которые могут занимать логи
         db.execute("""
             CREATE TABLE IF NOT EXISTS workers (
                 user_id INTEGER PRIMARY KEY,
@@ -65,7 +73,6 @@ def init_db():
             )
         """)
 
-        # Таблица предложений официального Telegram-маркета
         db.execute("""
             CREATE TABLE IF NOT EXISTS market_offers (
                 market TEXT NOT NULL,
@@ -77,37 +84,35 @@ def init_db():
                 currency TEXT,
                 price REAL,
                 active INTEGER NOT NULL DEFAULT 1,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (market, gift_id)
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        # МИГРАЦИЯ СТАРОЙ БАЗЫ
-        # Проверяем существующие колонки, чтобы не создавать их повторно.
-        columns = {
-            row["name"]
-            for row in db.execute(
-                "PRAGMA table_info(market_offers)"
-            ).fetchall()
-        }
+        # Миграция старой таблицы листингов.
+        _add_column(db, "listings", "owner_url", "TEXT")
+        _add_column(db, "listings", "topic", "TEXT")
+        _add_column(
+            db, "listings", "status",
+            "TEXT NOT NULL DEFAULT 'open'"
+        )
+        _add_column(db, "listings", "claimed_by", "INTEGER")
+        _add_column(db, "listings", "message_id", "INTEGER")
+        _add_column(db, "listings", "created_at", "TEXT")
 
-        if "currency" not in columns:
-            db.execute("""
-                ALTER TABLE market_offers
-                ADD COLUMN currency TEXT
-            """)
-
-        if "price" not in columns:
-            db.execute("""
-                ALTER TABLE market_offers
-                ADD COLUMN price REAL
-            """)
-
-        if "updated_at" not in columns:
-            db.execute("""
-                ALTER TABLE market_offers
-                ADD COLUMN updated_at TEXT
-            """)
+        # Миграция старой таблицы предложений.
+        _add_column(db, "market_offers", "collection", "TEXT")
+        _add_column(db, "market_offers", "model", "TEXT")
+        _add_column(db, "market_offers", "backdrop", "TEXT")
+        _add_column(db, "market_offers", "pattern", "TEXT")
+        _add_column(db, "market_offers", "currency", "TEXT")
+        _add_column(db, "market_offers", "price", "REAL")
+        _add_column(
+            db, "market_offers", "active",
+            "INTEGER NOT NULL DEFAULT 1"
+        )
+        _add_column(
+            db, "market_offers", "updated_at", "TEXT"
+        )
 
         db.execute("""
             UPDATE market_offers
@@ -115,7 +120,22 @@ def init_db():
             WHERE updated_at IS NULL
         """)
 
-        # Индекс для быстрого расчёта флора
+        # Убираем возможные старые дубликаты перед созданием индекса.
+        db.execute("""
+            DELETE FROM market_offers
+            WHERE rowid NOT IN (
+                SELECT MAX(rowid)
+                FROM market_offers
+                GROUP BY market, gift_id
+            )
+        """)
+
+        db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_market_gift_unique
+            ON market_offers(market, gift_id)
+        """)
+
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_offers_floor
             ON market_offers (
@@ -165,13 +185,8 @@ def insert_listing(listing):
     with conn() as db:
         cur = db.execute("""
             INSERT OR IGNORE INTO listings (
-                id,
-                title,
-                price,
-                details,
-                gift_url,
-                owner_url,
-                topic
+                id, title, price, details,
+                gift_url, owner_url, topic
             )
             VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
@@ -184,7 +199,22 @@ def insert_listing(listing):
             str(listing["topic"]),
         ))
 
-        return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return True
+
+        # Если предыдущая попытка оборвалась до отправки,
+        # разрешаем повторную публикацию.
+        old = db.execute("""
+            SELECT status, message_id
+            FROM listings
+            WHERE id=?
+        """, (str(listing["id"]),)).fetchone()
+
+        return bool(
+            old
+            and old["status"] == "open"
+            and old["message_id"] is None
+        )
 
 
 def delete_unpublished_listing(listing_id):
@@ -203,15 +233,10 @@ def set_message_id(listing_id, message_id):
             UPDATE listings
             SET message_id=?
             WHERE id=?
-        """, (
-            int(message_id),
-            str(listing_id),
-        ))
+        """, (int(message_id), str(listing_id)))
 
 
 def claim_listing(listing_id, user_id):
-    # Атомарное занятие лога.
-    # Один листинг может получить только один пользователь.
     with conn() as db:
         cur = db.execute("""
             UPDATE listings
@@ -219,17 +244,12 @@ def claim_listing(listing_id, user_id):
                 claimed_by=?
             WHERE id=?
               AND status='open'
-        """, (
-            int(user_id),
-            str(listing_id),
-        ))
+        """, (int(user_id), str(listing_id)))
 
         return cur.rowcount == 1
 
 
 def release_claim(listing_id, user_id):
-    # Возвращаем лог в свободное состояние,
-    # если отправка личного сообщения не удалась.
     with conn() as db:
         cur = db.execute("""
             UPDATE listings
@@ -238,23 +258,16 @@ def release_claim(listing_id, user_id):
             WHERE id=?
               AND status='claimed'
               AND claimed_by=?
-        """, (
-            str(listing_id),
-            int(user_id),
-        ))
+        """, (str(listing_id), int(user_id)))
 
         return cur.rowcount == 1
 
 
 def replace_collection_offers(collection, offers):
-    """
-    Обновляет все предложения одной коллекции
-    в рамках одной транзакции.
-    """
-
     offers = list(offers)
 
     with conn() as db:
+        # Вызывается только после полного получения страниц коллекции.
         db.execute("""
             UPDATE market_offers
             SET active=0,
@@ -271,29 +284,11 @@ def replace_collection_offers(collection, offers):
 
             db.execute("""
                 INSERT INTO market_offers (
-                    market,
-                    gift_id,
-                    collection,
-                    model,
-                    backdrop,
-                    pattern,
-                    currency,
-                    price,
-                    active,
-                    updated_at
+                    market, gift_id, collection,
+                    model, backdrop, pattern,
+                    currency, price, active, updated_at
                 )
-                VALUES (
-                    'telegram',
-                    ?,
-                    ?,
-                    ?,
-                    ?,
-                    ?,
-                    'ton',
-                    ?,
-                    1,
-                    CURRENT_TIMESTAMP
-                )
+                VALUES (?, ?, ?, ?, ?, ?, 'ton', ?, 1, CURRENT_TIMESTAMP)
                 ON CONFLICT(market, gift_id)
                 DO UPDATE SET
                     collection=excluded.collection,
@@ -305,6 +300,7 @@ def replace_collection_offers(collection, offers):
                     active=1,
                     updated_at=CURRENT_TIMESTAMP
             """, (
+                "telegram",
                 str(offer["gift_id"]),
                 str(collection),
                 offer.get("model"),
@@ -324,11 +320,12 @@ def save_market_offer(
     currency,
     price,
 ):
-    # Совместимость с прежним интерфейсом.
     if str(market).lower() != "telegram":
         return
 
-    if str(currency).lower() not in ("ton", "gram"):
+    currency = str(currency).lower()
+
+    if currency not in ("ton", "gram"):
         return
 
     try:
@@ -336,7 +333,7 @@ def save_market_offer(
     except (TypeError, ValueError):
         return
 
-    if str(currency).lower() == "gram":
+    if currency == "gram":
         value /= 1_000_000_000
 
     if value <= 0:
@@ -345,27 +342,12 @@ def save_market_offer(
     with conn() as db:
         db.execute("""
             INSERT INTO market_offers (
-                market,
-                gift_id,
-                collection,
-                model,
-                backdrop,
-                pattern,
-                currency,
-                price,
-                active,
-                updated_at
+                market, gift_id, collection,
+                model, backdrop, pattern,
+                currency, price, active, updated_at
             )
             VALUES (
-                'telegram',
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                'ton',
-                ?,
-                1,
+                'telegram', ?, ?, ?, ?, ?, 'ton', ?, 1,
                 CURRENT_TIMESTAMP
             )
             ON CONFLICT(market, gift_id)
@@ -388,19 +370,8 @@ def save_market_offer(
         ))
 
 
-def find_floor(
-    collection,
-    model,
-    backdrop,
-    pattern,
-):
-    """
-    Ищет минимальную цену в TON.
-
-    Текущее предложение также участвует в расчёте.
-    """
-
-    fields = [
+def find_floor(collection, model, backdrop, pattern):
+    search_levels = [
         (
             "model + backdrop + pattern",
             [
@@ -427,17 +398,12 @@ def find_floor(
         ),
         (
             "collection",
-            [
-                ("collection", collection),
-            ],
+            [("collection", collection)],
         ),
     ]
 
-    for label, conditions in fields:
-        if any(
-            value is None or value == ""
-            for _, value in conditions
-        ):
+    for label, conditions in search_levels:
+        if any(value is None or value == "" for _, value in conditions):
             continue
 
         where = [
@@ -447,7 +413,6 @@ def find_floor(
             "price IS NOT NULL",
             "price > 0",
         ]
-
         values = []
 
         for field, value in conditions:
@@ -455,9 +420,8 @@ def find_floor(
             values.append(value)
 
         sql = (
-            "SELECT MIN(price) "
-            "FROM market_offers "
-            "WHERE " + " AND ".join(where)
+            "SELECT MIN(price) FROM market_offers WHERE "
+            + " AND ".join(where)
         )
 
         with conn() as db:
