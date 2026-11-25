@@ -2,7 +2,7 @@
 import logging
 import os
 from html import escape
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from telegram import (
     InlineKeyboardButton,
@@ -46,11 +46,13 @@ def valid_url(value):
             return bool(parsed.netloc)
 
         if parsed.scheme == "tg" and parsed.netloc == "user":
-            return bool(parsed.query)
+            params = parse_qs(parsed.query)
+            user_id = params.get("id", [None])[0]
+            return bool(user_id and user_id.isdigit())
 
         return False
 
-    except ValueError:
+    except (TypeError, ValueError):
         return False
 
 
@@ -77,20 +79,27 @@ def claim_keyboard(listing_id):
 
 
 def private_keyboard(row):
-    return InlineKeyboardMarkup([
+    buttons = [
         [
             InlineKeyboardButton(
                 "Поставить подарок",
                 url=row["gift_url"],
             )
-        ],
-        [
+        ]
+    ]
+
+    owner_url = row["owner_url"]
+
+    # Никогда не подменяем профиль ссылкой на подарок.
+    if valid_url(owner_url):
+        buttons.append([
             InlineKeyboardButton(
                 "View owner",
-                url=row["owner_url"] or row["gift_url"],
+                url=owner_url,
             )
-        ],
-    ])
+        ])
+
+    return InlineKeyboardMarkup(buttons)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -171,9 +180,11 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Отсутствие owner_url больше не блокирует занятие.
     if not claim_listing(listing_id, user_id):
-        await query.answer("Этот лог уже занят.", show_alert=True)
+        await query.answer(
+            "Этот лог уже занят.",
+            show_alert=True,
+        )
         return
 
     await query.answer("Лог закреплён за вами.")
@@ -195,7 +206,10 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except TelegramError:
-        log.exception("Не удалось скрыть карточку %s", listing_id)
+        log.exception(
+            "Не удалось скрыть карточку %s",
+            listing_id,
+        )
 
     try:
         await context.bot.send_message(
@@ -207,7 +221,7 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         log.info(
-            "Лог %s успешно отправлен пользователю %s",
+            "Лог %s отправлен пользователю %s",
             listing_id,
             user_id,
         )
@@ -249,7 +263,9 @@ async def claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         except TelegramError:
-            log.exception("Не удалось отправить сообщение об ошибке DM")
+            log.exception(
+                "Не удалось отправить сообщение об ошибке DM"
+            )
 
 
 def register_handlers(app):
