@@ -1,3 +1,4 @@
+
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -39,6 +40,7 @@ def init_db():
     with conn() as db:
         db.execute("PRAGMA journal_mode=WAL")
 
+        # Таблица листингов
         db.execute("""
             CREATE TABLE IF NOT EXISTS listings (
                 id TEXT PRIMARY KEY,
@@ -55,6 +57,7 @@ def init_db():
             )
         """)
 
+        # Таблица пользователей, которые могут занимать логи
         db.execute("""
             CREATE TABLE IF NOT EXISTS workers (
                 user_id INTEGER PRIMARY KEY,
@@ -62,6 +65,7 @@ def init_db():
             )
         """)
 
+        # Таблица предложений официального Telegram-маркета
         db.execute("""
             CREATE TABLE IF NOT EXISTS market_offers (
                 market TEXT NOT NULL,
@@ -78,6 +82,40 @@ def init_db():
             )
         """)
 
+        # МИГРАЦИЯ СТАРОЙ БАЗЫ
+        # Проверяем существующие колонки, чтобы не создавать их повторно.
+        columns = {
+            row["name"]
+            for row in db.execute(
+                "PRAGMA table_info(market_offers)"
+            ).fetchall()
+        }
+
+        if "currency" not in columns:
+            db.execute("""
+                ALTER TABLE market_offers
+                ADD COLUMN currency TEXT
+            """)
+
+        if "price" not in columns:
+            db.execute("""
+                ALTER TABLE market_offers
+                ADD COLUMN price REAL
+            """)
+
+        if "updated_at" not in columns:
+            db.execute("""
+                ALTER TABLE market_offers
+                ADD COLUMN updated_at TEXT
+            """)
+
+        db.execute("""
+            UPDATE market_offers
+            SET updated_at=CURRENT_TIMESTAMP
+            WHERE updated_at IS NULL
+        """)
+
+        # Индекс для быстрого расчёта флора
         db.execute("""
             CREATE INDEX IF NOT EXISTS idx_offers_floor
             ON market_offers (
@@ -89,6 +127,8 @@ def init_db():
                 pattern
             )
         """)
+
+    print("База данных успешно инициализирована")
 
 
 def set_worker(user_id):
@@ -170,8 +210,8 @@ def set_message_id(listing_id, message_id):
 
 
 def claim_listing(listing_id, user_id):
-    # Атомарное занятие: два человека не смогут
-    # одновременно получить один и тот же лог.
+    # Атомарное занятие лога.
+    # Один листинг может получить только один пользователь.
     with conn() as db:
         cur = db.execute("""
             UPDATE listings
@@ -188,6 +228,8 @@ def claim_listing(listing_id, user_id):
 
 
 def release_claim(listing_id, user_id):
+    # Возвращаем лог в свободное состояние,
+    # если отправка личного сообщения не удалась.
     with conn() as db:
         cur = db.execute("""
             UPDATE listings
@@ -206,10 +248,8 @@ def release_claim(listing_id, user_id):
 
 def replace_collection_offers(collection, offers):
     """
-    Полностью обновляет одну коллекцию в одной транзакции.
-
-    Если сохранение хотя бы одного предложения завершится
-    ошибкой, старый снимок коллекции останется в базе.
+    Обновляет все предложения одной коллекции
+    в рамках одной транзакции.
     """
 
     offers = list(offers)
@@ -284,7 +324,7 @@ def save_market_offer(
     currency,
     price,
 ):
-    # Оставлено для совместимости с прежним кодом.
+    # Совместимость с прежним интерфейсом.
     if str(market).lower() != "telegram":
         return
 
@@ -357,8 +397,7 @@ def find_floor(
     """
     Ищет минимальную цену в TON.
 
-    Важно: текущее предложение тоже участвует в расчёте.
-    Иначе единственный подарок в коллекции не получит floor.
+    Текущее предложение также участвует в расчёте.
     """
 
     fields = [
