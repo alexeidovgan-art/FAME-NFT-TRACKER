@@ -1,3 +1,4 @@
+
 import logging
 import os
 from html import escape
@@ -42,10 +43,15 @@ def valid_http_url(value):
 
     try:
         parsed = urlparse(str(value))
-        return (
-            parsed.scheme in ("https", "http")
-            and bool(parsed.netloc)
-        )
+
+        if parsed.scheme in ("https", "http"):
+            return bool(parsed.netloc)
+
+        if parsed.scheme == "tg" and parsed.netloc == "user":
+            return bool(parsed.query)
+
+        return False
+
     except ValueError:
         return False
 
@@ -107,16 +113,13 @@ async def publish_listing(bot, listing):
 
     if missing:
         raise ValueError(
-            "Не хватает полей листинга: "
-            + ", ".join(missing)
+            "Не хватает полей: " + ", ".join(missing)
         )
 
     topic = listing["topic"]
 
     if topic not in TOPICS:
-        raise ValueError(
-            f"Неизвестная категория топика: {topic}"
-        )
+        raise ValueError(f"Неизвестная категория: {topic}")
 
     if GROUP_ID == 0:
         raise RuntimeError("GROUP_ID равен 0")
@@ -168,8 +171,7 @@ async def publish_listing(bot, listing):
         delete_unpublished_listing(listing["id"])
 
         log.exception(
-            "НЕ УДАЛОСЬ ОТПРАВИТЬ ЛИСТИНГ: "
-            "id=%s, группа=%s, топик=%s",
+            "НЕ УДАЛОСЬ ОТПРАВИТЬ ЛИСТИНГ: id=%s, группа=%s, топик=%s",
             listing["id"],
             GROUP_ID,
             TOPICS[topic],
