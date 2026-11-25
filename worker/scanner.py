@@ -13,6 +13,7 @@ from telethon.tl.functions.payments import (
     GetStarGiftsRequest,
 )
 from telethon.tl.types import PeerUser
+from telegram.error import RetryAfter
 
 from bot.db import replace_collection_offers, find_floor
 from worker.publish import publish_listing
@@ -24,6 +25,13 @@ PAGE_LIMIT = 100
 MAX_PAGES = 1000
 REQUEST_RETRIES = 5
 REQUEST_DELAYS = (2, 4, 8, 16, 30)
+
+# Каждые 100 страниц публикуем отдельную партию.
+PUBLISH_EVERY_PAGES = 100
+
+# Пауза между сообщениями в группу, чтобы не упираться
+# в ограничения Telegram на отправку сообщений.
+PUBLISH_DELAY_SECONDS = 3.2
 
 
 def get_scan_interval():
@@ -59,7 +67,10 @@ def is_temporary_error(error):
             "TimeoutError",
             "ConnectionError",
         }
-        or isinstance(error, (asyncio.TimeoutError, OSError, ConnectionError))
+        or isinstance(
+            error,
+            (asyncio.TimeoutError, OSError, ConnectionError),
+        )
     )
 
 
@@ -70,7 +81,11 @@ async def telegram_request(client, request, description):
 
         except FloodWaitError as error:
             wait_seconds = int(error.seconds) + 1
-            log.warning("%s: FloodWait %s сек.", description, wait_seconds)
+            log.warning(
+                "%s: FloodWait %s сек.",
+                description,
+                wait_seconds,
+            )
             await asyncio.sleep(wait_seconds)
 
         except asyncio.CancelledError:
@@ -81,10 +96,14 @@ async def telegram_request(client, request, description):
                 raise
 
             if attempt >= REQUEST_RETRIES:
-                log.exception("%s: запрос не выполнен", description)
+                log.exception(
+                    "%s: запрос не выполнен",
+                    description,
+                )
                 raise
 
             delay = REQUEST_DELAYS[attempt - 1]
+
             log.warning(
                 "%s: ошибка %s, попытка %s/%s через %s сек.",
                 description,
@@ -93,18 +112,15 @@ async def telegram_request(client, request, description):
                 REQUEST_RETRIES,
                 delay,
             )
+
             await asyncio.sleep(delay)
 
-    raise RuntimeError(f"{description}: превышено число попыток")
+    raise RuntimeError(
+        f"{description}: превышено число попыток"
+    )
 
 
 def is_offchain(gift):
-    """
-    Единственная причина пропуска:
-    Telegram вернул блокчейн-адрес самого подарка
-    или адрес владельца.
-    host_id отдельно не фильтруем.
-    """
     return not bool(
         getattr(gift, "gift_address", None)
         or getattr(gift, "owner_address", None)
@@ -144,12 +160,18 @@ def get_prices(gift):
 
         if "ton" in kind:
             raw = getattr(amount, "amount", None)
+
             if raw is not None and int(raw) > 0:
                 ton_nanos = int(raw)
 
         elif "stars" in kind:
-            whole = int(getattr(amount, "amount", 0) or 0)
-            nanos = int(getattr(amount, "nanos", 0) or 0)
+            whole = int(
+                getattr(amount, "amount", 0) or 0
+            )
+            nanos = int(
+                getattr(amount, "nanos", 0) or 0
+            )
+
             value = whole + nanos / 1_000_000_000
 
             if value > 0:
@@ -179,19 +201,28 @@ def get_owner(gift, users_by_id):
     owner_id = peer.user_id
     user = users_by_id.get(owner_id)
 
-    username = getattr(user, "username", None) if user else None
+    username = (
+        getattr(user, "username", None)
+        if user else None
+    )
 
     full_name = " ".join(
         part for part in (
-            getattr(user, "first_name", None) if user else None,
-            getattr(user, "last_name", None) if user else None,
-        ) if part
+            getattr(user, "first_name", None)
+            if user else None,
+            getattr(user, "last_name", None)
+            if user else None,
+        )
+        if part
     ).strip()
 
     if username:
         username = str(username).lstrip("@")
 
-        if re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        if re.fullmatch(
+            r"[A-Za-z0-9_]{5,32}",
+            username,
+        ):
             return {
                 "name": full_name or username,
                 "url": f"https://t.me/{username}",
@@ -216,6 +247,7 @@ def save_collection_snapshot(collection, gifts):
             continue
 
         slug = getattr(gift, "slug", None)
+
         if not slug:
             continue
 
@@ -229,22 +261,38 @@ def save_collection_snapshot(collection, gifts):
             "pattern": attrs["pattern"],
         })
 
-    replace_collection_offers(collection, offers)
+    replace_collection_offers(
+        collection,
+        offers,
+    )
 
     log.info(
-        "Коллекция %s: предложений для TON-floor=%s",
+        "Коллекция %s: сохранено TON-предложений для Floor: %s",
         collection,
         len(offers),
     )
 
 
-async def publish_collection(bot, collection, gifts, users_by_id):
+async def publish_collection(
+    bot,
+    collection,
+    gifts,
+    users_by_id,
+    batch_number,
+):
     published = 0
     skipped_blockchain = 0
     failed = 0
+    duplicates = 0
+
+    log.info(
+        "НАЧАЛО ПУБЛИКАЦИИ: коллекция=%s, партия=%s, подарков=%s",
+        collection,
+        batch_number,
+        len(gifts),
+    )
 
     for gift in gifts:
-        # Никаких других фильтров исключения лота.
         if not is_offchain(gift):
             skipped_blockchain += 1
             continue
@@ -255,7 +303,10 @@ async def publish_collection(bot, collection, gifts, users_by_id):
         )
 
         if not slug:
-            slug = f"{collection}-{getattr(gift, 'num', 'unknown')}"
+            slug = (
+                f"{collection}-"
+                f"{getattr(gift, 'num', 'unknown')}"
+            )
 
         slug = str(slug)
 
@@ -297,11 +348,16 @@ async def publish_collection(bot, collection, gifts, users_by_id):
             )
 
         details = (
-            f"📉 Floor Price: <b>{floor_text}</b>\n"
-            f"🔎 Совпадение: {html.escape(str(scope or '—'))}\n"
-            f"🎨 Model: {html.escape(str(attrs['model'] or 'Неизвестно'))}\n"
-            f"🖼 Backdrop: {html.escape(str(attrs['backdrop'] or 'Неизвестно'))}\n"
-            f"🔣 Pattern: {html.escape(str(attrs['pattern'] or 'Неизвестно'))}\n"
+            f"📉 Floor Price (по просмотренным предложениям): "
+            f"<b>{floor_text}</b>\n"
+            f"🔎 Совпадение: "
+            f"{html.escape(str(scope or '—'))}\n"
+            f"🎨 Model: "
+            f"{html.escape(str(attrs['model'] or 'Неизвестно'))}\n"
+            f"🖼 Backdrop: "
+            f"{html.escape(str(attrs['backdrop'] or 'Неизвестно'))}\n"
+            f"🔣 Pattern: "
+            f"{html.escape(str(attrs['pattern'] or 'Неизвестно'))}\n"
             f"{owner_line}\n"
             f"📊 Источник: официальный маркет Telegram"
         )
@@ -312,29 +368,84 @@ async def publish_collection(bot, collection, gifts, users_by_id):
             "price": price,
             "details": details,
             "gift_url": f"https://t.me/nft/{slug}",
-            "owner_url": owner_url or f"https://t.me/nft/{slug}",
+            "owner_url": (
+                owner_url
+                or f"https://t.me/nft/{slug}"
+            ),
             "topic": topic_for(floor),
         }
 
-        try:
-            result = await publish_listing(bot, listing)
+        sent = False
 
-            if result:
-                published += 1
+        for attempt in range(1, 4):
+            try:
+                result = await publish_listing(
+                    bot,
+                    listing,
+                )
 
-        except asyncio.CancelledError:
-            raise
+                if result:
+                    published += 1
+                    sent = True
 
-        except Exception:
+                    await asyncio.sleep(
+                        PUBLISH_DELAY_SECONDS
+                    )
+                else:
+                    duplicates += 1
+
+                break
+
+            except RetryAfter as error:
+                retry_value = error.retry_after
+
+                if hasattr(retry_value, "total_seconds"):
+                    wait_seconds = (
+                        retry_value.total_seconds()
+                    )
+                else:
+                    wait_seconds = float(retry_value)
+
+                wait_seconds += 1
+
+                log.warning(
+                    "Telegram ограничил отправку. "
+                    "Подарок %s, попытка %s/3, ожидание %.1f сек.",
+                    slug,
+                    attempt,
+                    wait_seconds,
+                )
+
+                await asyncio.sleep(wait_seconds)
+
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
+                failed += 1
+
+                log.exception(
+                    "Ошибка публикации подарка %s",
+                    slug,
+                )
+                break
+
+        if not sent and failed == 0 and attempt >= 3:
             failed += 1
-            log.exception("Ошибка публикации подарка %s", slug)
+            log.error(
+                "Не удалось опубликовать подарок %s после 3 попыток",
+                slug,
+            )
 
     log.info(
-        "ИТОГ КОЛЛЕКЦИИ %s: получено=%s, опубликовано=%s, "
-        "пропущено blockchain=%s, ошибок отправки=%s",
+        "ИТОГ ПАРТИИ: коллекция=%s, партия=%s, "
+        "получено=%s, опубликовано=%s, дубликатов=%s, "
+        "пропущено blockchain=%s, ошибок=%s",
         collection,
+        batch_number,
         len(gifts),
         published,
+        duplicates,
         skipped_blockchain,
         failed,
     )
@@ -343,11 +454,17 @@ async def publish_collection(bot, collection, gifts, users_by_id):
 async def scan_collection(client, bot, base):
     collection = str(base.id)
 
-    gifts = []
+    # Все полученные подарки нужны для расчёта Floor.
+    all_gifts = []
+
+    # Отдельно храним подарки текущей партии.
+    batch_gifts = []
+
     users_by_id = {}
 
     offset = ""
     page = 0
+    batch_number = 0
 
     while True:
         page += 1
@@ -370,13 +487,21 @@ async def scan_collection(client, bot, base):
             f"Коллекция {collection}, страница {page}",
         )
 
-        page_gifts = getattr(response, "gifts", []) or []
-        gifts.extend(page_gifts)
+        page_gifts = (
+            getattr(response, "gifts", []) or []
+        )
+
+        all_gifts.extend(page_gifts)
+        batch_gifts.extend(page_gifts)
 
         for user in getattr(response, "users", []) or []:
             users_by_id[user.id] = user
 
-        next_offset = getattr(response, "next_offset", None)
+        next_offset = getattr(
+            response,
+            "next_offset",
+            None,
+        )
 
         log.info(
             "Коллекция %s: страница %s, получено %s подарков",
@@ -384,6 +509,36 @@ async def scan_collection(client, bot, base):
             page,
             len(page_gifts),
         )
+
+        # Каждые 100 страниц сохраняем накопленные цены,
+        # рассчитываем Floor и публикуем текущую партию.
+        if page % PUBLISH_EVERY_PAGES == 0:
+            batch_number += 1
+
+            log.info(
+                "ПАРТИЯ ГОТОВА: коллекция=%s, партия=%s, "
+                "страницы=%s-%s, подарков=%s",
+                collection,
+                batch_number,
+                page - PUBLISH_EVERY_PAGES + 1,
+                page,
+                len(batch_gifts),
+            )
+
+            save_collection_snapshot(
+                collection,
+                all_gifts,
+            )
+
+            await publish_collection(
+                bot,
+                collection,
+                batch_gifts,
+                users_by_id,
+                batch_number,
+            )
+
+            batch_gifts.clear()
 
         if not next_offset:
             break
@@ -394,23 +549,49 @@ async def scan_collection(client, bot, base):
             )
 
         offset = next_offset
+
         await asyncio.sleep(0.15)
 
-    # Снимок обновляется после полного получения всех страниц.
-    save_collection_snapshot(collection, gifts)
+    # Публикуем остаток, если страниц меньше 100
+    # или после последней полной партии остались подарки.
+    if batch_gifts:
+        batch_number += 1
 
-    await publish_collection(
-        bot,
+        log.info(
+            "ПОСЛЕДНЯЯ ПАРТИЯ: коллекция=%s, партия=%s, "
+            "подарков=%s",
+            collection,
+            batch_number,
+            len(batch_gifts),
+        )
+
+        save_collection_snapshot(
+            collection,
+            all_gifts,
+        )
+
+        await publish_collection(
+            bot,
+            collection,
+            batch_gifts,
+            users_by_id,
+            batch_number,
+        )
+
+    log.info(
+        "ИТОГ КОЛЛЕКЦИИ %s: всего получено подарков=%s, партий=%s",
         collection,
-        gifts,
-        users_by_id,
+        len(all_gifts),
+        batch_number,
     )
 
-    return len(gifts)
+    return len(all_gifts)
 
 
 async def scan_once(client, bot):
-    log.info("========== НАЧАЛО СКАНИРОВАНИЯ ==========")
+    log.info(
+        "========== НАЧАЛО СКАНИРОВАНИЯ =========="
+    )
 
     catalog = await telegram_request(
         client,
@@ -418,10 +599,13 @@ async def scan_once(client, bot):
         "Каталог Telegram",
     )
 
-    base_gifts = getattr(catalog, "gifts", []) or []
+    base_gifts = (
+        getattr(catalog, "gifts", []) or []
+    )
 
     resale_gifts = [
-        gift for gift in base_gifts
+        gift
+        for gift in base_gifts
         if getattr(gift, "availability_resale", None)
     ]
 
@@ -432,7 +616,9 @@ async def scan_once(client, bot):
     )
 
     if not resale_gifts:
-        log.warning("В каталоге не найдено типов подарков resale")
+        log.warning(
+            "В каталоге не найдено типов подарков resale"
+        )
         return
 
     scanned = 0
@@ -441,7 +627,12 @@ async def scan_once(client, bot):
 
     for base in resale_gifts:
         try:
-            count = await scan_collection(client, bot, base)
+            count = await scan_collection(
+                client,
+                bot,
+                base,
+            )
+
             scanned += count
             successful += 1
 
@@ -453,12 +644,17 @@ async def scan_once(client, bot):
 
         except Exception:
             failed += 1
-            log.exception("Ошибка коллекции %s", base.id)
+
+            log.exception(
+                "Ошибка коллекции %s",
+                base.id,
+            )
 
         await asyncio.sleep(0.2)
 
     log.info(
-        "СКАНИРОВАНИЕ ЗАВЕРШЕНО: коллекций=%s, ошибок=%s, подарков=%s",
+        "СКАНИРОВАНИЕ ЗАВЕРШЕНО: "
+        "коллекций=%s, ошибок=%s, подарков=%s",
         successful,
         failed,
         scanned,
@@ -466,9 +662,20 @@ async def scan_once(client, bot):
 
 
 async def run_scanner(bot):
-    session_string = os.getenv("TG_SESSION", "").strip()
-    api_id = os.getenv("API_ID", "").strip()
-    api_hash = os.getenv("API_HASH", "").strip()
+    session_string = os.getenv(
+        "TG_SESSION",
+        "",
+    ).strip()
+
+    api_id = os.getenv(
+        "API_ID",
+        "",
+    ).strip()
+
+    api_hash = os.getenv(
+        "API_HASH",
+        "",
+    ).strip()
 
     if not session_string or not api_id or not api_hash:
         log.error(
@@ -483,8 +690,10 @@ async def run_scanner(bot):
         return
 
     log.info(
-        "Сканер настроен. Интервал: %s секунд",
+        "Сканер настроен. Интервал: %s секунд. "
+        "Публикация каждые %s страниц.",
         SCAN_INTERVAL,
+        PUBLISH_EVERY_PAGES,
     )
 
     while True:
@@ -499,7 +708,10 @@ async def run_scanner(bot):
 
             client.flood_sleep_threshold = 60
 
-            log.info("Подключение к официальному Telegram API...")
+            log.info(
+                "Подключение к официальному Telegram API..."
+            )
+
             await client.connect()
 
             if not await client.is_user_authorized():
@@ -515,32 +727,53 @@ async def run_scanner(bot):
 
             while True:
                 if not client.is_connected():
-                    raise ConnectionError("Соединение Telethon потеряно")
+                    raise ConnectionError(
+                        "Соединение Telethon потеряно"
+                    )
 
-                started = asyncio.get_running_loop().time()
+                started = (
+                    asyncio.get_running_loop().time()
+                )
 
                 try:
-                    await scan_once(client, bot)
+                    await scan_once(
+                        client,
+                        bot,
+                    )
 
                 except asyncio.CancelledError:
                     raise
 
                 except FloodWaitError as error:
-                    wait_seconds = int(error.seconds) + 1
-                    log.warning("FloodWait: %s секунд", wait_seconds)
+                    wait_seconds = (
+                        int(error.seconds) + 1
+                    )
+
+                    log.warning(
+                        "FloodWait: %s секунд",
+                        wait_seconds,
+                    )
+
                     await asyncio.sleep(wait_seconds)
                     continue
 
                 except Exception:
-                    log.exception("Ошибка цикла сканирования")
+                    log.exception(
+                        "Ошибка цикла сканирования"
+                    )
+
                     await asyncio.sleep(20)
                     continue
 
                 elapsed = (
-                    asyncio.get_running_loop().time() - started
+                    asyncio.get_running_loop().time()
+                    - started
                 )
 
-                wait_time = max(30, SCAN_INTERVAL - elapsed)
+                wait_time = max(
+                    30,
+                    SCAN_INTERVAL - elapsed,
+                )
 
                 log.info(
                     "Следующий цикл через %.0f секунд",
@@ -553,11 +786,16 @@ async def run_scanner(bot):
             raise
 
         except Exception:
-            log.exception("Сканер отключился")
+            log.exception(
+                "Сканер отключился"
+            )
 
         finally:
             if client and client.is_connected():
                 await client.disconnect()
 
-        log.warning("Переподключение через 15 секунд")
+        log.warning(
+            "Переподключение через 15 секунд"
+        )
+
         await asyncio.sleep(15)
