@@ -1,0 +1,6 @@
+{
+  "cheap": {"min": 0, "max": 100},
+  "mid": {"min": 100, "max": 500},
+  "expensive": {"min": 500, "max": 2000},
+  "premium": {"min": 2000, "max": null}
+}
